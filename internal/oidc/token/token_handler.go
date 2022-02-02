@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/ory/fosite"
 	"github.com/ory/x/errorsx"
@@ -187,6 +188,15 @@ func upstreamOIDCRefresh(ctx context.Context, session *psession.PinnipedSession,
 			WithDebugf("provider name: %q, provider type: %q", s.ProviderName, s.ProviderType))
 	}
 	if refreshedGroups != nil {
+		oldGroupsInterface := session.Fosite.Claims.Extra[oidc.DownstreamGroupsClaim].([]interface{})
+		oldGroups := []string{}
+		for _, i := range oldGroupsInterface {
+			oldGroups = append(oldGroups, i.(string))
+		}
+		diffString := diffSortedGroups(oldGroups, refreshedGroups)
+		if diffString != "" {
+			warning.AddWarning(ctx, "", "groups have changed since login: "+diffString)
+		}
 		session.Fosite.Claims.Extra[oidc.DownstreamGroupsClaim] = refreshedGroups
 	}
 
@@ -200,6 +210,51 @@ func upstreamOIDCRefresh(ctx context.Context, session *psession.PinnipedSession,
 	}
 
 	return nil
+}
+
+// print out the diff between two lists of sorted groups.
+func diffSortedGroups(oldGroups, newGroups []string) string {
+	oCounter := 0
+	nCounter := 0
+	added := []string{}
+	removed := []string{}
+	for oCounter < len(oldGroups) && nCounter < len(newGroups) {
+		o := oldGroups[oCounter]
+		n := newGroups[nCounter]
+		switch strings.Compare(o, n) {
+		case 0: // the two strings are equal
+			oCounter++
+			nCounter++
+		case -1: // n is lexicographically greater (aka earlier) than o
+			// this indicates that a string has been removed from newGroups that
+			// was in oldGroups.
+			removed = append(removed, o)
+			oCounter++
+		case 1: // o is lexicographically greater
+			// this indicates that a string has been added to newGroups
+			// that wasn't in oldGroups
+			added = append(added, n)
+			nCounter++
+		}
+	}
+	// add the rest
+	for oCounter < len(oldGroups) {
+		removed = append(removed, oldGroups[oCounter])
+		oCounter++
+	}
+	for nCounter < len(newGroups) {
+		added = append(added, newGroups[nCounter])
+		nCounter++
+	}
+
+	finalString := ""
+	if len(added) > 0 {
+		finalString += "+" + strings.Join(added, ", +") + ". "
+	}
+	if len(removed) > 0 {
+		finalString += "-" + strings.Join(removed, ", -") + ". "
+	}
+	return finalString
 }
 
 func validateIdentityUnchangedSinceInitialLogin(mergedClaims map[string]interface{}, session *psession.PinnipedSession, usernameClaimName string) error {

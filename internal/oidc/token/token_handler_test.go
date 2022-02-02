@@ -3624,3 +3624,46 @@ func toSliceOfInterface(s []string) []interface{} {
 	}
 	return r
 }
+
+func TestDiffSortedGroups(t *testing.T) {
+	tests := []struct {
+		name       string
+		oldGroups  []string
+		newGroups  []string
+		wantOutput string
+	}{
+		{
+			name:       "groups were added",
+			oldGroups:  []string{"b", "c"},
+			newGroups:  []string{"a", "b", "bb", "c", "d"},
+			wantOutput: "+a, +bb, +d. ",
+		},
+		{
+			name:       "groups were removed",
+			oldGroups:  []string{"a", "b", "bb", "c", "d"},
+			newGroups:  []string{"b", "c"},
+			wantOutput: "-a, -bb, -d. ",
+		},
+		{
+			name:       "groups were added and removed",
+			oldGroups:  []string{"a", "c"},
+			newGroups:  []string{"b", "c", "d"},
+			wantOutput: "+b, +d. -a. ",
+		},
+		{
+			name:       "groups are exactly the same",
+			oldGroups:  []string{"a", "b", "c"},
+			newGroups:  []string{"a", "b", "c"},
+			wantOutput: "",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			output := diffSortedGroups(test.oldGroups, test.newGroups)
+			require.Equal(t, test.wantOutput, output)
+		})
+	}
+}
