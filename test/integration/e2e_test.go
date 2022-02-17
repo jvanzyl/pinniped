@@ -40,6 +40,7 @@ import (
 	"go.pinniped.dev/internal/crud"
 	"go.pinniped.dev/internal/here"
 	"go.pinniped.dev/internal/oidc"
+	"go.pinniped.dev/internal/psession"
 	"go.pinniped.dev/internal/testutil"
 	"go.pinniped.dev/pkg/oidcclient"
 	"go.pinniped.dev/pkg/oidcclient/filesession"
@@ -52,7 +53,7 @@ import (
 func TestE2EFullIntegration_Browser(t *testing.T) { // nolint:gocyclo
 	env := testlib.IntegrationEnv(t)
 
-	ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancelFunc()
 
 	// Build pinniped CLI.
@@ -522,6 +523,122 @@ func TestE2EFullIntegration_Browser(t *testing.T) { // nolint:gocyclo
 			expectedUsername,
 			expectedGroups,
 		)
+	})
+
+	// TODO maybe this shouldn't be in e2e tests because it messes with session data and isn't truly end to end...
+	t.Run("LDAP refresh flow", func(t *testing.T) {
+		if len(env.ToolsNamespace) == 0 && !env.HasCapability(testlib.CanReachInternetLDAPPorts) {
+			t.Skip("LDAP integration test requires connectivity to an LDAP server")
+		}
+
+		expectedUsername := env.SupervisorUpstreamLDAP.TestUserMailAttributeValue
+		//expectedGroups := env.SupervisorUpstreamLDAP.TestUserDirectGroupsDNs
+
+		setupClusterForEndToEndLDAPTest(t, expectedUsername, env)
+
+		// Use a specific session cache for this test.
+		sessionCachePath := tempDir + "/ldap-test-sessions-refresh.yaml"
+		kubeconfigPath := runPinnipedGetKubeconfig(t, env, pinnipedExe, tempDir, []string{
+			"get", "kubeconfig",
+			"--concierge-api-group-suffix", env.APIGroupSuffix,
+			"--concierge-authenticator-type", "jwt",
+			"--concierge-authenticator-name", authenticator.Name,
+			"--oidc-session-cache", sessionCachePath,
+		})
+
+		// Run "kubectl get namespaces" which should trigger a cli-based login.
+		start := time.Now()
+		kubectlCmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", "--kubeconfig", kubeconfigPath)
+		kubectlCmd.Env = append(os.Environ(), env.ProxyEnv()...)
+		stdoutPipe, err := kubectlCmd.StdoutPipe()
+		require.NoError(t, err)
+		ptyFile, err := pty.Start(kubectlCmd)
+		require.NoError(t, err)
+
+		// Wait for the subprocess to print the username prompt, then type the user's username.
+		readFromFileUntilStringIsSeen(t, ptyFile, "Username: ")
+		_, err = ptyFile.WriteString(expectedUsername + "\n")
+		require.NoError(t, err)
+
+		// Wait for the subprocess to print the password prompt, then type the user's password.
+		readFromFileUntilStringIsSeen(t, ptyFile, "Password: ")
+		_, err = ptyFile.WriteString(env.SupervisorUpstreamLDAP.TestUserPassword + "\n")
+		require.NoError(t, err)
+
+		// Read all of the remaining output from the subprocess until EOF.
+		t.Logf("waiting for kubectl to output namespace list")
+		// Read all output from the subprocess until EOF.
+		// Ignore any errors returned because there is always an error on linux.
+		kubectlStdOutOutputBytes, _ := ioutil.ReadAll(stdoutPipe)
+		requireKubectlGetNamespaceOutput(t, env, string(kubectlStdOutOutputBytes))
+
+		t.Logf("first kubectl command took %s", time.Since(start).String())
+
+		// To simulate the groups having changed without actually changing the groups the user belongs to in the LDAP
+		// server, we update the refresh token secret to have a different value for the groups.
+		// Then the refresh flow will update them back to their real values.
+		// To do this, we get the refresh token signature out of the cache, use it to get the Secret, update it, and
+		// put it back.
+		cache := filesession.New(sessionCachePath, filesession.WithErrorReporter(func(err error) {
+			require.NoError(t, err)
+		}))
+
+		downstreamScopes := []string{coreosoidc.ScopeOfflineAccess, coreosoidc.ScopeOpenID, "pinniped:request-audience"}
+		sort.Strings(downstreamScopes)
+		sessionCacheKey := oidcclient.SessionCacheKey{
+			Issuer:      downstream.Spec.Issuer,
+			ClientID:    "pinniped-cli",
+			Scopes:      downstreamScopes,
+			RedirectURI: "http://localhost:0/callback",
+		}
+		token := cache.GetToken(sessionCacheKey)
+		require.NotNil(t, token)
+
+		kubeClient := testlib.NewKubernetesClientset(t).CoreV1()
+		refreshTokenSignature := strings.Split(token.RefreshToken.Token, ".")[1]
+		oauthStore := oidc.NewKubeStorage(kubeClient.Secrets(env.SupervisorNamespace), oidc.DefaultOIDCTimeoutsConfiguration())
+		storedRefreshSession, err := oauthStore.GetRefreshTokenSession(ctx, refreshTokenSignature, nil)
+		require.NoError(t, err)
+
+		pinnipedSession, ok := storedRefreshSession.GetSession().(*psession.PinnipedSession)
+		require.True(t, ok, "should have been able to cast session data to PinnipedSession")
+		pinnipedSession.Fosite.Claims.Extra["groups"] = []string{"some-wrong-group", "some-other-group"}
+
+		require.NoError(t, oauthStore.DeleteRefreshTokenSession(ctx, refreshTokenSignature))
+		require.NoError(t, oauthStore.CreateRefreshTokenSession(ctx, refreshTokenSignature, storedRefreshSession))
+
+		//
+		//// id token = nil will force refresh probably
+		//t.Logf("Forcing refresh by putting expired token in the cache")
+		//token.IDToken.Expiry = metav1.Time{}
+		//cache.PutToken(sessionCacheKey, token)
+
+		// wait for the existing tokens to expire, triggering the refresh flow.
+		time.Sleep(6 * time.Minute)
+
+		// 	Run kubectl, which should work without any prompting for authentication.
+		kubectlCmd2 := exec.CommandContext(ctx, "kubectl", "get", "namespace", "--kubeconfig", kubeconfigPath)
+		kubectlCmd2.Env = append(os.Environ(), env.ProxyEnv()...)
+		startTime2 := time.Now()
+		stdoutPipe2, err := kubectlCmd2.StdoutPipe()
+		require.NoError(t, err)
+		ptyFile2, err := pty.Start(kubectlCmd2)
+		require.NoError(t, err)
+
+		// Read all of the remaining output from the subprocess until EOF.
+		t.Logf("waiting for kubectl to output namespace list")
+		// Read all output from the subprocess until EOF.
+		// Ignore any errors returned because there is always an error on linux.
+		kubectlStdOutOutputBytes2, _ := ioutil.ReadAll(stdoutPipe2)
+		kubectlStdErrOutputBytes2, _ := ioutil.ReadAll(ptyFile2)
+		requireKubectlGetNamespaceOutput(t, env, string(kubectlStdOutOutputBytes2))
+		t.Log(string(kubectlStdErrOutputBytes2))
+		t.Log(string(kubectlStdOutOutputBytes2))
+
+		// the output should include a warning that the groups have changed.
+		require.Contains(t, string(kubectlStdErrOutputBytes2), "groups have changed since login:")
+
+		t.Logf("second kubectl command took %s", time.Since(startTime2).String())
 	})
 
 	t.Run("with Supervisor OIDC upstream IDP and CLI password flow without web browser", func(t *testing.T) {

@@ -375,6 +375,11 @@ func upstreamLDAPRefresh(ctx context.Context, providerCache oidc.UpstreamIdentit
 	// Replace the old value with the new value.
 	session.Fosite.Claims.Extra[oidc.DownstreamGroupsClaim] = groups
 
+	diffString := diffSortedGroups(oldGroups, groups)
+	if diffString != "" {
+		warning.AddWarning(ctx, "", "groups have changed since login: "+diffString)
+	}
+
 	return nil
 }
 
